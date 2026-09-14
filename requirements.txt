@@ -1,0 +1,3 @@
+aiogram>=3.13,<4
+matplotlib>=3.8
+logihub-dashboard @ git+https://github.com/starpxand/logihub-dashboard@v1.1.0
