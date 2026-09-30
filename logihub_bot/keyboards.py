@@ -25,7 +25,7 @@ def client_menu() -> ReplyKeyboardMarkup:
 
 
 def manager_menu() -> ReplyKeyboardMarkup:
-    return _reply([[QUEUE, IN_WORK], [KPI, HELP]])
+    return _reply([[QUEUE, IN_WORK], [TRACK, KPI], [HELP]])
 
 
 def _inline(buttons: list[tuple[str, str]], per_row: int = 2) -> InlineKeyboardMarkup:
