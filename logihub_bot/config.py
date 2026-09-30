@@ -19,6 +19,7 @@ def _load_dotenv(path: Path) -> None:
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
+    manager_bot_token: str
     manager_code: str = "logihub-manager"
     db_path: str = "logihub_bot.sqlite3"
     orders_csv: str = "data/logistics_orders.csv"
@@ -30,8 +31,13 @@ def load_settings(env_file: str = ".env") -> Settings:
     token = os.getenv("BOT_TOKEN", "")
     if not token:
         raise RuntimeError("Не задан BOT_TOKEN – получите токен у @BotFather и укажите его в файле .env")
+    manager_token = os.getenv("MANAGER_BOT_TOKEN", "")
+    if not manager_token:
+        raise RuntimeError("Не задан MANAGER_BOT_TOKEN – создайте у @BotFather второго бота для менеджеров "
+                           "и укажите его токен в файле .env")
     return Settings(
         bot_token=token,
+        manager_bot_token=manager_token,
         manager_code=os.getenv("MANAGER_CODE", "logihub-manager"),
         db_path=os.getenv("DB_PATH", "logihub_bot.sqlite3"),
         orders_csv=os.getenv("ORDERS_CSV", "data/logistics_orders.csv"),

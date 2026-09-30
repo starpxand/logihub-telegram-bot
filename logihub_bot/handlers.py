@@ -1,4 +1,9 @@
-"""Обработчики бота: сценарии клиента и менеджера по BPMN-модели процесса."""
+"""Обработчики двух ботов по BPMN-модели процесса.
+
+Клиентский бот – заявка, статус, приёмка груза. Бот менеджера – проверка заявок,
+управление заказами, закрытие и KPI. Уведомления между ролями уходят через «чужой» бот:
+о новой заявке менеджеру пишет бот менеджера, о смене статуса клиенту – клиентский бот.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +15,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message, ReplyKeyboardRemove
 
 from . import keyboards as kb
 from . import texts
@@ -38,55 +43,66 @@ class Claim(StatesGroup):
     text = State()
 
 
-def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> Router:
-    r = Router(name="logihub")
+class Login(StatesGroup):
+    code = State()
 
-    async def notify(bot: Bot, chat_ids, text: str, markup=None) -> None:
-        for chat_id in set(chat_ids):
-            try:
-                await bot.send_message(chat_id, text, reply_markup=markup)
-            except Exception as exc:  # пользователь мог заблокировать бота
-                log.warning("notify %s failed: %s", chat_id, exc)
 
-    def menu(user_id: int):
-        return kb.manager_menu() if storage.role(user_id) == "manager" else kb.client_menu()
+async def notify(bot: Bot, chat_ids, text: str, markup=None) -> None:
+    for chat_id in set(chat_ids):
+        try:
+            await bot.send_message(chat_id, text, reply_markup=markup)
+        except Exception as exc:  # пользователь мог не запускать бота или заблокировать его
+            log.warning("notify %s failed: %s", chat_id, exc)
 
-    # ---------- общие ----------
+
+def _fallbacks(r: Router, menu) -> None:
+    @r.callback_query()
+    async def stale_button(c: CallbackQuery):
+        await c.answer("Кнопка устарела – откройте нужный раздел в меню.", show_alert=True)
+
+    @r.message()
+    async def unknown(m: Message):
+        await m.answer("Не понял сообщение 🙂 Выберите действие в меню ниже или отправьте /help.",
+                       reply_markup=menu(m.from_user.id))
+
+
+# =====================================================================
+# Клиентский бот
+# =====================================================================
+def build_client_router(storage: Storage, settings: Settings, manager_bot: Bot, manager_username: str) -> Router:
+    r = Router(name="client")
+
+    def menu(_user_id: int):
+        return kb.client_menu()
+
     @r.message(CommandStart())
     async def start(m: Message, state: FSMContext):
         await state.clear()
         if storage.role(m.from_user.id) is None:
             storage.upsert_user(m.from_user.id, m.from_user.full_name, "client")
-        await m.answer(texts.WELCOME.format(name=escape(m.from_user.first_name or "")), reply_markup=menu(m.from_user.id))
+        await m.answer(texts.WELCOME.format(name=escape(m.from_user.first_name or ""), manager_bot=manager_username),
+                       reply_markup=menu(m.from_user.id))
 
     @r.message(Command("help"))
     @r.message(F.text == kb.HELP)
     async def help_(m: Message):
-        await m.answer(texts.HELP, reply_markup=menu(m.from_user.id))
+        await m.answer(texts.HELP_CLIENT.format(manager_bot=manager_username), reply_markup=menu(m.from_user.id))
 
     @r.message(Command("cancel"))
     async def cancel(m: Message, state: FSMContext):
         await state.clear()
         await m.answer("Действие отменено.", reply_markup=menu(m.from_user.id))
 
-    @r.message(Command("manager"))
-    async def as_manager(m: Message, command: CommandObject):
-        if (command.args or "").strip() != settings.manager_code:
-            await m.answer("⛔ Неверный код менеджера.")
-            return
-        storage.upsert_user(m.from_user.id, m.from_user.full_name, "manager")
-        await m.answer("🔑 Режим менеджера включён. Новые заявки будут приходить вам автоматически.",
-                       reply_markup=kb.manager_menu())
+    @r.message(Command("manager", "kpi"))
+    async def to_manager_bot(m: Message):
+        await m.answer(f"🔑 Для менеджеров работает отдельный бот: @{manager_username}")
 
-    @r.message(Command("client"))
-    async def as_client(m: Message):
-        storage.upsert_user(m.from_user.id, m.from_user.full_name, "client")
-        await m.answer("Режим клиента включён.", reply_markup=kb.client_menu())
-
-    # ---------- клиент: новая заявка (этапы BPMN 1–2, 6) ----------
+    # ---------- новая заявка (этапы BPMN 1–2, 6) ----------
     @r.message(Command("new"))
     @r.message(F.text == kb.NEW_ORDER)
     async def new_order(m: Message, state: FSMContext):
+        if storage.role(m.from_user.id) is None:
+            storage.upsert_user(m.from_user.id, m.from_user.full_name, "client")
         await state.set_state(NewOrder.destination)
         await m.answer("📦 <b>Новая заявка на перевозку</b>\nОтправка со склада в Комсомольске-на-Амуре.\n\n"
                        "Шаг 1 из 4. Выберите город доставки:", reply_markup=kb.destinations())
@@ -143,14 +159,14 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
         await m.answer(texts.quote_card(q), reply_markup=kb.confirm_order())
 
     @r.callback_query(NewOrder.confirm, F.data == "order:send")
-    async def order_send(c: CallbackQuery, state: FSMContext, bot: Bot):
+    async def order_send(c: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         q = quote(data["destination"], data["cargo"], data["weight"], date.fromisoformat(data["ship_date"]))
         order = storage.create_order(c.from_user.id, q)
         await state.clear()
         await c.message.edit_text(texts.quote_card(q) + f"\n\n✅ Заявка <b>{order.number}</b> отправлена менеджеру на проверку.")
         await c.message.answer("Я пришлю уведомление, когда менеджер проверит заявку.", reply_markup=kb.client_menu())
-        await notify(bot, storage.managers(), "🆕 Новая заявка на проверку\n\n" + texts.order_card(order),
+        await notify(manager_bot, storage.managers(), "🆕 Новая заявка на проверку\n\n" + texts.order_card(order),
                      kb.review(order.id))
         await c.answer("Заявка отправлена")
 
@@ -160,7 +176,7 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
         await c.message.edit_text("Заявка отменена.")
         await c.answer()
 
-    # ---------- клиент: заказы, статус, приёмка (этапы 15–22) ----------
+    # ---------- заказы, статус, приёмка (этапы 15–22) ----------
     @r.message(F.text == kb.MY_ORDERS)
     async def my_orders(m: Message):
         orders = storage.list(client_id=m.from_user.id)
@@ -191,7 +207,7 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
     async def show_status(m: Message, raw: str):
         order_id = parse_number(raw)
         order = storage.get(order_id) if order_id else None
-        if order is None or (storage.role(m.from_user.id) != "manager" and order.client_id != m.from_user.id):
+        if order is None or order.client_id != m.from_user.id:
             await m.answer("Заказ не найден. Проверьте номер.", reply_markup=menu(m.from_user.id))
             return
         await m.answer(texts.order_card(order, storage.history(order.id)), reply_markup=menu(m.from_user.id))
@@ -214,26 +230,32 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
         return True
 
     @r.callback_query(F.data.startswith("acc:ok:"))
-    async def accept_ok(c: CallbackQuery, bot: Bot):
-        if not await own_order(c, int(c.data.split(":")[2])):
+    async def accept_ok(c: CallbackQuery):
+        oid = int(c.data.split(":")[2])
+        if not await own_order(c, oid):
             return
-        order = await change(c, int(c.data.split(":")[2]), "accepted", "Акт приёмки подписан клиентом")
-        if order:
-            await c.message.edit_text(texts.order_card(order) + "\n\n✍️ Акт приёмки подписан. Спасибо!")
-            await notify(bot, storage.managers(), f"✍️ Клиент подписал акт по заказу {order.number}. Заказ можно закрыть.",
-                         kb.close_claim(order.id))
+        try:
+            order = storage.set_status(oid, "accepted", "Акт приёмки подписан клиентом")
+        except TransitionError as exc:
+            await c.answer(str(exc), show_alert=True)
+            return
+        await c.answer("Готово")
+        await c.message.edit_text(texts.order_card(order) + "\n\n✍️ Акт приёмки подписан. Спасибо!")
+        await notify(manager_bot, storage.managers(),
+                     f"✍️ Клиент подписал акт по заказу {order.number}. Заказ можно закрыть.", kb.close_claim(order.id))
 
     @r.callback_query(F.data.startswith("acc:claim:"))
     async def accept_claim(c: CallbackQuery, state: FSMContext):
-        if not await own_order(c, int(c.data.split(":")[2])):
+        oid = int(c.data.split(":")[2])
+        if not await own_order(c, oid):
             return
         await state.set_state(Claim.text)
-        await state.update_data(order_id=int(c.data.split(":")[2]))
+        await state.update_data(order_id=oid)
         await c.message.answer("Опишите замечания: что не так с грузом (недовложение, повреждение, температура)?")
         await c.answer()
 
     @r.message(Claim.text)
-    async def claim_text(m: Message, state: FSMContext, bot: Bot):
+    async def claim_text(m: Message, state: FSMContext):
         if not m.text:
             await m.answer("Опишите замечания текстом одним сообщением (или /cancel для отмены).")
             return
@@ -245,22 +267,81 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
             await m.answer(f"⚠️ {exc}")
             return
         await m.answer(f"📝 Претензия по заказу {order.number} передана менеджеру.", reply_markup=kb.client_menu())
-        await notify(bot, storage.managers(), "⚠️ Новая претензия\n\n" + texts.order_card(order), kb.close_claim(order.id))
+        await notify(manager_bot, storage.managers(), "⚠️ Новая претензия\n\n" + texts.order_card(order),
+                     kb.close_claim(order.id))
 
-    # ---------- менеджер (этапы 3–4, 14–18, 23–26) ----------
+    _fallbacks(r, menu)
+    return r
+
+
+# =====================================================================
+# Бот менеджера
+# =====================================================================
+def build_manager_router(storage: Storage, analytics: Analytics, settings: Settings, client_bot: Bot) -> Router:
+    r = Router(name="manager")
+
     def is_manager(user_id: int) -> bool:
         return storage.role(user_id) == "manager"
 
+    def menu(user_id: int):
+        return kb.manager_menu() if is_manager(user_id) else ReplyKeyboardRemove()
+
     async def manager_only(c: CallbackQuery) -> bool:
         if not is_manager(c.from_user.id):
-            await c.answer("Действие доступно только менеджеру.", show_alert=True)
+            await c.answer("Сначала войдите: /start и код доступа менеджера.", show_alert=True)
             return False
         return True
 
+    # ---------- вход ----------
+    @r.message(CommandStart())
+    async def start(m: Message, state: FSMContext):
+        await state.clear()
+        if is_manager(m.from_user.id):
+            await m.answer(texts.WELCOME_MANAGER.format(name=escape(m.from_user.first_name or "")),
+                           reply_markup=kb.manager_menu())
+            return
+        await state.set_state(Login.code)
+        await m.answer("🔐 <b>ЛогиХаб – рабочее место менеджера</b>\n\nВведите код доступа менеджера:",
+                       reply_markup=ReplyKeyboardRemove())
+
+    @r.message(Command("cancel"))
+    async def cancel(m: Message, state: FSMContext):
+        await state.clear()
+        await m.answer("Действие отменено.", reply_markup=menu(m.from_user.id))
+
+    @r.message(Login.code)
+    async def login(m: Message, state: FSMContext):
+        if (m.text or "").strip() != settings.manager_code:
+            await m.answer("⛔ Неверный код. Попробуйте ещё раз или /cancel.")
+            return
+        await state.clear()
+        storage.upsert_user(m.from_user.id, m.from_user.full_name, "manager")
+        await m.answer(texts.WELCOME_MANAGER.format(name=escape(m.from_user.first_name or "")),
+                       reply_markup=kb.manager_menu())
+        new = storage.list(status="new")
+        if new:
+            await m.answer(f"📋 Заявок на проверку: <b>{len(new)}</b>. Откройте «{kb.QUEUE}».")
+
+    @r.message(Command("logout"))
+    async def logout(m: Message, state: FSMContext):
+        await state.clear()
+        storage.upsert_user(m.from_user.id, m.from_user.full_name, "client")
+        await m.answer("Вы вышли из рабочего места менеджера. Войти снова – /start.", reply_markup=ReplyKeyboardRemove())
+
+    # всё остальное – только после входа
+    @r.message(lambda m: not is_manager(m.from_user.id))
+    async def not_logged(m: Message):
+        await m.answer("🔐 Чтобы работать с заявками, войдите: /start и код доступа менеджера.",
+                       reply_markup=ReplyKeyboardRemove())
+
+    @r.message(Command("help"))
+    @r.message(F.text == kb.HELP)
+    async def help_(m: Message):
+        await m.answer(texts.HELP_MANAGER, reply_markup=kb.manager_menu())
+
+    # ---------- проверка заявок (этапы 3–5) ----------
     @r.message(F.text == kb.QUEUE)
     async def queue(m: Message):
-        if not is_manager(m.from_user.id):
-            return
         orders = storage.list(status="new")
         if not orders:
             await m.answer("✨ Новых заявок нет.")
@@ -268,27 +349,27 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
             await m.answer(texts.order_card(o), reply_markup=kb.review(o.id))
 
     @r.callback_query(F.data.startswith("rev:"))
-    async def review(c: CallbackQuery, bot: Bot):
+    async def review(c: CallbackQuery):
         if not await manager_only(c):
             return
         _, action, oid = c.data.split(":")
         if action == "ok":
             order = await change(c, int(oid), "confirmed", "Заявка проверена менеджером, договор-счёт сформирован")
             if order:
-                await c.message.edit_text(texts.order_card(order) + "\n\n✅ Подтверждена", reply_markup=kb.work(order.id, "confirmed"))
-                await notify(bot, [order.client_id], f"✅ Заявка {order.number} проверена. Договор-счёт на "
+                await c.message.edit_text(texts.order_card(order) + "\n\n✅ Подтверждена",
+                                          reply_markup=kb.work(order.id, "confirmed"))
+                await notify(client_bot, [order.client_id], f"✅ Заявка {order.number} проверена. Договор-счёт на "
                              f"{texts.rub(order.price)} сформирован, ожидаем оплату.")
         else:
             order = await change(c, int(oid), "clarify", "Нужно уточнить контакт получателя")
             if order:
                 await c.message.edit_text(texts.order_card(order) + "\n\n↩️ Возвращена на уточнение")
-                await notify(bot, [order.client_id], f"↩️ Заявка {order.number} возвращена на уточнение: "
+                await notify(client_bot, [order.client_id], f"↩️ Заявка {order.number} возвращена на уточнение: "
                              "укажите телефон ответственного на складе получателя. Оформите заявку заново.")
 
+    # ---------- заказы в работе (этапы 14–18) ----------
     @r.message(F.text == kb.IN_WORK)
     async def in_work(m: Message):
-        if not is_manager(m.from_user.id):
-            return
         orders = [o for s in ("confirmed", "in_transit", "delayed") for o in storage.list(status=s)]
         if not orders:
             await m.answer("Нет заказов в работе.")
@@ -296,7 +377,7 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
             await m.answer(texts.order_card(o), reply_markup=kb.work(o.id, o.status))
 
     @r.callback_query(F.data.startswith("wrk:"))
-    async def work(c: CallbackQuery, bot: Bot):
+    async def work(c: CallbackQuery):
         if not await manager_only(c):
             return
         _, action, oid = c.data.split(":")
@@ -319,16 +400,17 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
         if order:
             markup = kb.work(order.id, order.status) if order.status in ("in_transit", "delayed") else None
             await c.message.edit_text(texts.order_card(order), reply_markup=markup)
-            await notify(bot, [order.client_id], msg)
+            await notify(client_bot, [order.client_id], msg)
 
+    # ---------- закрытие (этапы 23–26) ----------
     @r.callback_query(F.data.startswith("clm:close:"))
-    async def close(c: CallbackQuery, bot: Bot):
+    async def close(c: CallbackQuery):
         if not await manager_only(c):
             return
         order = await change(c, int(c.data.split(":")[2]), "closed", "Заказ закрыт, OTIF пересчитан")
         if order:
             await c.message.edit_text(texts.order_card(order, storage.history(order.id)))
-            await notify(bot, [order.client_id], f"🏁 Заказ {order.number} закрыт. Спасибо, что выбрали ЛогиХаб!")
+            await notify(client_bot, [order.client_id], f"🏁 Заказ {order.number} закрыт. Спасибо, что выбрали ЛогиХаб!")
 
     async def change(c: CallbackQuery, order_id: int, status: str, note: str, eta=None):
         try:
@@ -339,13 +421,37 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
         await c.answer("Готово")
         return order
 
+    # ---------- поиск заказа ----------
+    @r.message(Command("status"))
+    async def status_cmd(m: Message, command: CommandObject, state: FSMContext):
+        if command.args:
+            await show_status(m, command.args)
+        else:
+            await state.set_state(Track.number)
+            await m.answer("Введите номер заказа, например LH-20001:")
+
+    @r.message(F.text == kb.TRACK)
+    async def track(m: Message, state: FSMContext):
+        await state.set_state(Track.number)
+        await m.answer("Введите номер заказа, например LH-20001:")
+
+    @r.message(Track.number)
+    async def track_number(m: Message, state: FSMContext):
+        await state.clear()
+        await show_status(m, m.text or "")
+
+    async def show_status(m: Message, raw: str):
+        order_id = parse_number(raw)
+        order = storage.get(order_id) if order_id else None
+        if order is None:
+            await m.answer("Заказ не найден. Проверьте номер.", reply_markup=kb.manager_menu())
+            return
+        await m.answer(texts.order_card(order, storage.history(order.id)), reply_markup=kb.manager_menu())
+
     # ---------- KPI из дашборда ----------
     @r.message(Command("kpi"))
     @r.message(F.text == kb.KPI)
     async def kpi(m: Message):
-        if not is_manager(m.from_user.id):
-            await m.answer("📊 KPI и финансовые показатели доступны менеджеру. Включите режим: /manager &lt;код&gt;")
-            return
         await send_kpi(m, "M")
 
     @r.callback_query(F.data.startswith("kpi:"))
@@ -362,14 +468,5 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
                              f"\n\n🖥 Подробная аналитика – в дашборде: {settings.dashboard_url}",
                              reply_markup=kb.kpi(settings.dashboard_url))
 
-    # ---------- по умолчанию ----------
-    @r.callback_query()
-    async def stale_button(c: CallbackQuery):
-        await c.answer("Кнопка устарела – откройте нужный раздел в меню.", show_alert=True)
-
-    @r.message()
-    async def unknown(m: Message):
-        await m.answer("Не понял сообщение 🙂 Выберите действие в меню ниже или отправьте /help.",
-                       reply_markup=menu(m.from_user.id))
-
+    _fallbacks(r, menu)
     return r
