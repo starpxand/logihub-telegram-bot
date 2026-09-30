@@ -1,6 +1,7 @@
 """Хранилище пользователей, заказов и истории статусов (SQLite)."""
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -89,8 +90,8 @@ TRANSITIONS = {
 
 
 def parse_number(text: str) -> int | None:
-    text = text.strip().upper().replace("LH-", "").replace("LH", "")
-    return int(text) - 20000 if text.isdigit() and int(text) > 20000 else None
+    digits = re.sub(r"\D", "", text.upper().replace("LH", ""))
+    return int(digits) - 20000 if digits and int(digits) > 20000 else None
 
 
 class Storage:
