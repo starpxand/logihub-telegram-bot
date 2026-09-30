@@ -1,8 +1,10 @@
 """Обработчики бота: сценарии клиента и менеджера по BPMN-модели процесса."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, timedelta
+from html import escape
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -55,7 +57,7 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
         await state.clear()
         if storage.role(m.from_user.id) is None:
             storage.upsert_user(m.from_user.id, m.from_user.full_name, "client")
-        await m.answer(texts.WELCOME.format(name=m.from_user.first_name), reply_markup=menu(m.from_user.id))
+        await m.answer(texts.WELCOME.format(name=escape(m.from_user.first_name or "")), reply_markup=menu(m.from_user.id))
 
     @r.message(Command("help"))
     @r.message(F.text == kb.HELP)
@@ -204,8 +206,17 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
             await m.answer("📍 Груз доставлен. Проверьте количество, целостность и температурный режим.\n\n"
                            + texts.order_card(o), reply_markup=kb.acceptance(o.id))
 
+    async def own_order(c: CallbackQuery, order_id: int) -> bool:
+        order = storage.get(order_id)
+        if order is None or order.client_id != c.from_user.id:
+            await c.answer("Это не ваш заказ.", show_alert=True)
+            return False
+        return True
+
     @r.callback_query(F.data.startswith("acc:ok:"))
     async def accept_ok(c: CallbackQuery, bot: Bot):
+        if not await own_order(c, int(c.data.split(":")[2])):
+            return
         order = await change(c, int(c.data.split(":")[2]), "accepted", "Акт приёмки подписан клиентом")
         if order:
             await c.message.edit_text(texts.order_card(order) + "\n\n✍️ Акт приёмки подписан. Спасибо!")
@@ -214,6 +225,8 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
 
     @r.callback_query(F.data.startswith("acc:claim:"))
     async def accept_claim(c: CallbackQuery, state: FSMContext):
+        if not await own_order(c, int(c.data.split(":")[2])):
+            return
         await state.set_state(Claim.text)
         await state.update_data(order_id=int(c.data.split(":")[2]))
         await c.message.answer("Опишите замечания: что не так с грузом (недовложение, повреждение, температура)?")
@@ -221,6 +234,9 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
 
     @r.message(Claim.text)
     async def claim_text(m: Message, state: FSMContext, bot: Bot):
+        if not m.text:
+            await m.answer("Опишите замечания текстом одним сообщением (или /cancel для отмены).")
+            return
         data = await state.get_data()
         await state.clear()
         try:
@@ -235,6 +251,12 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
     def is_manager(user_id: int) -> bool:
         return storage.role(user_id) == "manager"
 
+    async def manager_only(c: CallbackQuery) -> bool:
+        if not is_manager(c.from_user.id):
+            await c.answer("Действие доступно только менеджеру.", show_alert=True)
+            return False
+        return True
+
     @r.message(F.text == kb.QUEUE)
     async def queue(m: Message):
         if not is_manager(m.from_user.id):
@@ -247,6 +269,8 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
 
     @r.callback_query(F.data.startswith("rev:"))
     async def review(c: CallbackQuery, bot: Bot):
+        if not await manager_only(c):
+            return
         _, action, oid = c.data.split(":")
         if action == "ok":
             order = await change(c, int(oid), "confirmed", "Заявка проверена менеджером, договор-счёт сформирован")
@@ -273,6 +297,8 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
 
     @r.callback_query(F.data.startswith("wrk:"))
     async def work(c: CallbackQuery, bot: Bot):
+        if not await manager_only(c):
+            return
         _, action, oid = c.data.split(":")
         order = storage.get(int(oid))
         if order is None:
@@ -297,6 +323,8 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
 
     @r.callback_query(F.data.startswith("clm:close:"))
     async def close(c: CallbackQuery, bot: Bot):
+        if not await manager_only(c):
+            return
         order = await change(c, int(c.data.split(":")[2]), "closed", "Заказ закрыт, OTIF пересчитан")
         if order:
             await c.message.edit_text(texts.order_card(order, storage.history(order.id)))
@@ -315,17 +343,33 @@ def build_router(storage: Storage, analytics: Analytics, settings: Settings) -> 
     @r.message(Command("kpi"))
     @r.message(F.text == kb.KPI)
     async def kpi(m: Message):
+        if not is_manager(m.from_user.id):
+            await m.answer("📊 KPI и финансовые показатели доступны менеджеру. Включите режим: /manager &lt;код&gt;")
+            return
         await send_kpi(m, "M")
 
     @r.callback_query(F.data.startswith("kpi:"))
     async def kpi_period(c: CallbackQuery):
+        if not await manager_only(c):
+            return
         await send_kpi(c.message, c.data[4:])
         await c.answer()
 
     async def send_kpi(m: Message, freq: str):
-        chart = BufferedInputFile(analytics.otif_chart(freq), filename="otif.png")
+        png = await asyncio.to_thread(analytics.otif_chart, freq)
+        chart = BufferedInputFile(png, filename="otif.png")
         await m.answer_photo(chart, caption=analytics.summary(freq) +
                              f"\n\n🖥 Подробная аналитика – в дашборде: {settings.dashboard_url}",
                              reply_markup=kb.kpi(settings.dashboard_url))
+
+    # ---------- по умолчанию ----------
+    @r.callback_query()
+    async def stale_button(c: CallbackQuery):
+        await c.answer("Кнопка устарела – откройте нужный раздел в меню.", show_alert=True)
+
+    @r.message()
+    async def unknown(m: Message):
+        await m.answer("Не понял сообщение 🙂 Выберите действие в меню ниже или отправьте /help.",
+                       reply_markup=menu(m.from_user.id))
 
     return r

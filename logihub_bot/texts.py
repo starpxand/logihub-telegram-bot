@@ -22,14 +22,18 @@ HELP = (
 )
 
 
+def num(value: float) -> str:
+    return f"{value:,.0f}".replace(",", " ")
+
+
 def rub(value: float) -> str:
-    return f"{value:,.0f} ₽".replace(",", " ")
+    return f"{num(value)} ₽"
 
 
 def quote_card(q: Quote) -> str:
     return (f"🧾 <b>Предварительный расчёт</b>\n\n"
             f"Маршрут: Комсомольск-на-Амуре → {escape(q.destination)} ({q.distance_km} км)\n"
-            f"Груз: {escape(q.cargo)}, {q.weight_kg:,.0f} кг\n".replace(",", " ") +
+            f"Груз: {escape(q.cargo)}, {num(q.weight_kg)} кг\n"
             f"Транспорт: {q.transport}\n"
             f"Отгрузка: {q.ship_date:%d.%m.%Y}, доставка: <b>{q.eta:%d.%m.%Y}</b>\n"
             f"Стоимость: <b>{rub(q.price)}</b>")
@@ -39,12 +43,13 @@ def order_card(o: Order, history=None) -> str:
     text = (f"📦 <b>Заказ {o.number}</b>\n"
             f"Статус: <b>{STATUSES[o.status]}</b>\n"
             f"Маршрут: → {escape(o.destination)}, {o.distance_km} км\n"
-            f"Груз: {escape(o.cargo)}, {o.weight_kg:,.0f} кг, {o.transport}\n".replace(",", " ") +
+            f"Груз: {escape(o.cargo)}, {num(o.weight_kg)} кг, {o.transport}\n"
             f"Доставка: {o.eta:%d.%m.%Y} · {rub(o.price)}")
     if o.comment:
         text += f"\n💬 {escape(o.comment)}"
     if history:
         text += "\n\n<b>История</b>\n" + "\n".join(
-            f"• {h['created_at'][11:16]} {STATUSES[h['status']]}" + (f" – {escape(h['note'])}" if h["note"] else "")
+            f"• {h['created_at'][8:10]}.{h['created_at'][5:7]} {h['created_at'][11:16]} {STATUSES[h['status']]}"
+            + (f" – {escape(h['note'])}" if h["note"] else "")
             for h in history)
     return text
