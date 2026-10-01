@@ -21,6 +21,7 @@ from .storage import Driver, Order, Storage, User
 _FONT_DIR = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
 pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(_FONT_DIR, "DejaVuSans.ttf")))
 pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(_FONT_DIR, "DejaVuSans-Bold.ttf")))
+pdfmetrics.registerFontFamily("DejaVu", normal="DejaVu", bold="DejaVu-Bold", italic="DejaVu", boldItalic="DejaVu-Bold")
 
 NAVY = colors.HexColor("#0b1b3f")
 ORANGE = colors.HexColor("#ff8a3d")
@@ -89,8 +90,8 @@ def invoice_pdf(order: Order, client: User | None, issued: datetime | None = Non
     issued = issued or now()
     deadline = order.pay_deadline or (issued + timedelta(days=PAYMENT_DAYS))
     rows = [["№", "Услуга", "Кол-во", "Сумма"],
-            ["1", f"Перевозка груза: {HUB} → {order.destination} ({order.distance_km} км), {order.transport}. "
-                  f"Груз: {_cargo(order)}", "1", money(order.price)]]
+            ["1", f"Перевозка груза: {HUB} → {order.destination} ({order.distance_km} км), "
+                  f"транспорт – {order.transport.lower()}. Груз: {_cargo(order)}", "1", money(order.price)]]
     if order.insurance:
         rows.append(["2", f"Страхование груза, объявленная стоимость {money(order.declared_value)}", "1",
                      money(order.insurance)])
