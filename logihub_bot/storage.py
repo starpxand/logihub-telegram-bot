@@ -31,15 +31,19 @@ ROLES = ("client", "manager")
 
 # Допустимые переходы (потоки операций BPMN)
 TRANSITIONS = {
-    "new": {"confirmed", "clarify", "cancelled"},  # «Заявка корректна?»
-    "clarify": {"new", "cancelled"},               # цикл уточнения
-    "confirmed": {"paid", "cancelled"},            # «Оплата поступила в течение 3 дней?»
+    # «Заявка корректна?»
+    "new": {"confirmed", "clarify", "cancelled"},
+    "clarify": {"new", "cancelled"},  # цикл уточнения
+    # «Оплата поступила в течение 3 дней?»
+    "confirmed": {"paid", "cancelled"},
     "paid": {"picking"},
-    "picking": {"picking", "ready"},               # «Груз укомплектован полностью?»
-    "ready": {"in_transit"},                       # только с назначенным водителем
-    "in_transit": {"delayed", "delivered"},        # таймер «Отклонение от графика»
+    # «Груз укомплектован полностью?»
+    "picking": {"picking", "ready"},
+    "ready": {"in_transit"},  # только с водителем
+    # таймер «Отклонение от графика»
+    "in_transit": {"delayed", "delivered"},
     "delayed": {"delayed", "delivered"},
-    "delivered": {"accepted", "claim"},            # «Есть замечания?»
+    "delivered": {"accepted", "claim"},  # «Есть замечания?»
     "accepted": {"closed"},
     "claim": {"closed"},
     "closed": set(),
